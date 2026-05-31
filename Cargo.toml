@@ -1,10 +1,21 @@
 [package]
-name = "rperf"
+name = "rperf3"
 version = "0.1.0"
 edition = "2021"
+description = "rPerf3 — a Rust iPerf3-compatible network throughput tool."
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-clap = "4.3.1"
+base64 = "0.22"
+clap = { version = "4.3.1", features = ["derive"] }
 num_enum = "0.6.1"
+rand = "0.8"
+rpassword = "7"
+rsa = "0.9"
+sha2 = "0.10"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
