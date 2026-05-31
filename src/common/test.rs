@@ -138,6 +138,10 @@ pub struct Config {
 	pub rsa_private_key: Option<std::path::PathBuf>,
 	/// Server: path to the authorized users CSV file (user,sha256hex).
 	pub authorized_users: Option<std::path::PathBuf>,
+	/// Server: refuse to start unless `rsa_private_key` and `authorized_users`
+	/// are both set. False by default to preserve the iperf3-style "just run
+	/// it" experience for local tests.
+	pub require_auth: bool,
 }
 
 impl Config {
@@ -173,6 +177,7 @@ impl Config {
 			rsa_public_key: None,
 			rsa_private_key: None,
 			authorized_users: None,
+			require_auth: false,
 		}
 	}
 
@@ -291,6 +296,7 @@ mod tests {
 			rsa_public_key: None,
 			rsa_private_key: None,
 			authorized_users: None,
+			require_auth: false,
 		};
 		assert_eq!(cfg.host_port(), "10.1.10.3:5202");
 	}

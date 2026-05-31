@@ -79,6 +79,13 @@ pub trait Socket {
 	/// Configure how long a blocking `recv` waits before returning an
 	/// error. Pass `None` to clear any previously-set deadline.
 	fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()>;
+	/// Configure how long a blocking `send` waits before returning an
+	/// error. Pass `None` to clear any previously-set deadline. The
+	/// default impl is a no-op; concrete implementations override where
+	/// the underlying socket actually supports a write deadline.
+	fn set_write_timeout(&mut self, _timeout: Option<Duration>) -> io::Result<()> {
+		Ok(())
+	}
 	/// Total TCP segment retransmissions on this socket since the
 	/// connection was established. Linux-only (via getsockopt +
 	/// TCP_INFO); other platforms return `Unsupported`.
@@ -105,6 +112,7 @@ impl Socket for Tcp {
 	fn send(&mut self, buf: &[u8]) -> io::Result<usize> { self.stream.write(buf) }
 	fn set_nonblocking(&mut self, nonblocking: bool) -> io::Result<()> { self.stream.set_nonblocking(nonblocking) }
 	fn set_read_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> { self.stream.set_read_timeout(timeout) }
+	fn set_write_timeout(&mut self, timeout: Option<Duration>) -> io::Result<()> { self.stream.set_write_timeout(timeout) }
 	fn try_clone_tcp(&self) -> io::Result<Box<dyn Socket + Send>> {
 		Ok(Box::new(self.try_clone()?))
 	}

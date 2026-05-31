@@ -15,6 +15,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::common::auth;
+use base64::Engine as _;
 use crate::common::cookie::{recv_cookie, COOKIE_LEN};
 use crate::common::cpu::{self, CpuUsage};
 use crate::common::interval::IntervalReporter;
@@ -31,6 +32,120 @@ use crate::common::Message;
 /// Tests that don't go through `run_server` never populate this, so auth is
 /// effectively disabled for them.
 static AUTH_CONFIG: OnceLock<(Option<PathBuf>, Option<PathBuf>)> = OnceLock::new();
+
+/// Process-wide replay cache for accepted authtokens. Populated lazily on
+/// the first successful `decode_authtoken` so it does not allocate memory
+/// in deployments where auth is disabled.
+static NONCE_CACHE: OnceLock<auth::NonceCache> = OnceLock::new();
+
+/// Minimum wall-clock duration of any `check_auth` call. Sleeping up to
+/// this floor before responding smears the RSA-OAEP decrypt timing
+/// variance that the `rsa` crate's Marvin sidechannel (RUSTSEC-2023-0071)
+/// would otherwise expose. The floor must apply on success and failure
+/// alike so the success-vs-failure latency does not become its own
+/// oracle.
+const AUTH_RESPONSE_FLOOR: Duration = Duration::from_millis(100);
+
+/// Sleep until `start.elapsed() >= AUTH_RESPONSE_FLOOR`, if it isn't
+/// already. Cheap when the auth path was naturally slow (e.g. cold
+/// PEM parse) and noticeable only on the fastest reject paths — which
+/// are exactly the ones that would otherwise leak timing.
+fn smear_auth_timing(start: Instant) {
+    let elapsed = start.elapsed();
+    if elapsed < AUTH_RESPONSE_FLOOR {
+        std::thread::sleep(AUTH_RESPONSE_FLOOR - elapsed);
+    }
+}
+
+/// Upper bounds on peer-supplied `ClientOptions` fields. Without these an
+/// unauthenticated peer can force unbounded `Vec` allocations and multi-year
+/// socket timeouts by submitting huge values for `parallel`, `len`, `time`,
+/// or `omit`.
+const MAX_PARALLEL_STREAMS: u32 = 128;
+const MAX_PAYLOAD_LEN: u32 = 1 * 1024 * 1024;
+const MAX_TEST_DURATION_SECS: u32 = 3600;
+const MAX_OMIT_SECS: u32 = 300;
+
+/// Cap on simultaneous concurrent sessions from a single source IP
+/// (only relevant when `max_concurrent > 1`). Prevents a single peer
+/// from filling all session slots and starving other clients.
+const PER_IP_SESSION_CAP: u32 = 4;
+
+/// Tracks per-source-IP in-flight session counts. Sessions acquire a
+/// `PerIpHandle` from `try_acquire`; the handle decrements the count
+/// when it is dropped (i.e. when the session thread exits, however it
+/// exits — clean return, error, or panic).
+#[derive(Clone, Default)]
+struct PerIpCounter {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>>,
+}
+
+impl PerIpCounter {
+    fn try_acquire(&self, ip: std::net::IpAddr, limit: u32) -> Option<PerIpHandle> {
+        let mut map = self.inner.lock().ok()?;
+        let count = map.entry(ip).or_insert(0);
+        if *count >= limit {
+            return None;
+        }
+        *count += 1;
+        Some(PerIpHandle {
+            inner: self.inner.clone(),
+            ip,
+        })
+    }
+}
+
+struct PerIpHandle {
+    inner: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<std::net::IpAddr, u32>>>,
+    ip: std::net::IpAddr,
+}
+
+impl Drop for PerIpHandle {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.inner.lock() {
+            if let Some(count) = map.get_mut(&self.ip) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    map.remove(&self.ip);
+                }
+            }
+        }
+    }
+}
+
+/// Reject any `ClientOptions` whose numeric fields exceed safe ceilings,
+/// before any allocation or socket-timeout uses them. Returns
+/// `InvalidInput` so the caller can map it to `AccessDenied`.
+fn validate_options(opts: &ClientOptions) -> io::Result<()> {
+    if opts.parallel == 0 || opts.parallel > MAX_PARALLEL_STREAMS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("parallel out of range: {}", opts.parallel),
+        ));
+    }
+    if opts.len == 0 || opts.len > MAX_PAYLOAD_LEN {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("len out of range: {}", opts.len),
+        ));
+    }
+    if opts.time > MAX_TEST_DURATION_SECS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("time out of range: {}", opts.time),
+        ));
+    }
+    if opts.omit > MAX_OMIT_SECS {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("omit out of range: {}", opts.omit),
+        ));
+    }
+    opts.time.checked_add(opts.omit).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "time + omit overflow")
+    })?;
+    Ok(())
+}
 
 /// Configure the server's RSA private key and authorized-users file paths.
 /// Must be called before `run_server_loop` / `serve_one_session` runs.
@@ -52,48 +167,59 @@ fn check_auth(control: &mut Protocol, opts: &ClientOptions) -> io::Result<()> {
         return Ok(()); // auth not configured
     };
 
-    let deny = |control: &mut Protocol, msg: &str| -> io::Result<()> {
-        eprintln!("auth failed: {}", msg);
-        let _ = send_control_byte(control.transfer.as_mut(), Message::AccessDenied);
-        Err(io::Error::new(io::ErrorKind::PermissionDenied, msg.to_string()))
-    };
+    let start = Instant::now();
+    let result = check_auth_inner(&pk_path, &users_path, opts);
 
-    let privkey = match auth::load_private_key_pem(&pk_path) {
-        Ok(k) => k,
-        Err(e) => {
-            eprintln!("auth config error: {}", e);
+    // Apply the constant-time floor BEFORE sending any wire response. This
+    // is what defangs the RSA-OAEP timing oracle (RUSTSEC-2023-0071) plus
+    // any residual leaks in the password-hash compare path.
+    smear_auth_timing(start);
+
+    match result {
+        Ok(()) => Ok(()),
+        Err(reason) => {
+            eprintln!("auth failed: {}", reason);
             let _ = send_control_byte(control.transfer.as_mut(), Message::AccessDenied);
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
+            // The wire response and the io::Error message are both opaque;
+            // only stderr (`auth failed: …`) contains the specific cause.
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "authentication failed",
+            ))
         }
-    };
-    let users = match auth::load_authorized_users(&users_path) {
-        Ok(u) => u,
-        Err(e) => {
-            eprintln!("auth config error: {}", e);
-            let _ = send_control_byte(control.transfer.as_mut(), Message::AccessDenied);
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, e));
-        }
-    };
-
-    let token = match opts.authtoken.as_ref() {
-        Some(t) => t,
-        None => return deny(control, "missing authtoken"),
-    };
-
-    let claim = match auth::decode_authtoken(&privkey, token) {
-        Ok(c) => c,
-        Err(e) => return deny(control, &e),
-    };
-
-    if let Err(e) = auth::validate_timestamp(&claim, auth::TIMESTAMP_SKEW_SECS) {
-        return deny(control, &e);
     }
+}
 
-    if let Err(e) = auth::authorize(&claim, &users) {
-        return deny(control, &e);
-    }
+/// All the actual auth logic, returning a plain `Result<(), String>` so
+/// the caller can apply a constant-time floor and a single uniform wire
+/// response. Never touches the control socket itself.
+fn check_auth_inner(
+    pk_path: &std::path::Path,
+    users_path: &std::path::Path,
+    opts: &ClientOptions,
+) -> Result<(), String> {
+    let privkey = auth::load_private_key_pem(pk_path)?;
+    let users = auth::load_authorized_users(users_path)?;
 
-    Ok(())
+    let token = opts.authtoken.as_ref().ok_or("missing authtoken")?;
+
+    // Decode base64 ourselves so we can key the replay cache on the raw
+    // ciphertext bytes (not the base64 representation, which an attacker
+    // could trivially perturb to bypass a string-keyed cache).
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(token)
+        .map_err(|e| format!("b64: {}", e))?;
+
+    let claim = auth::decode_authtoken_bytes(&privkey, &ciphertext)?;
+    auth::validate_timestamp(&claim, auth::TIMESTAMP_SKEW_SECS)?;
+
+    // Replay check: reject any ciphertext we have already accepted within
+    // the validity window. Inserted only after the timestamp passes so
+    // expired/skewed tokens cannot inflate the cache.
+    let cache = NONCE_CACHE.get_or_init(auth::NonceCache::new);
+    cache.check_and_record(&ciphertext)?;
+
+    auth::authorize(&claim, &users)
 }
 
 /// What a single reader thread observed. Keeps byte counts split into
@@ -160,6 +286,18 @@ pub const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Peer closed the control channel without fully participating in the
 /// post-test control-channel handshake. iperf3 3.21 TCP clients do this
 /// routinely after sending TEST_END.
+/// Heuristic: did the operator ask us to bind a loopback interface?
+/// Used only to decide whether to print the "no-auth on public bind"
+/// warning at startup; treating ambiguous values as non-loopback errs
+/// toward warning more often, which is the safe default.
+fn is_loopback_bind(host: &str) -> bool {
+    use std::net::IpAddr;
+    if let Ok(ip) = host.parse::<IpAddr>() {
+        return ip.is_loopback();
+    }
+    matches!(host, "localhost")
+}
+
 fn is_peer_closed(e: &io::Error) -> bool {
     matches!(
         e.kind(),
@@ -174,8 +312,29 @@ fn is_peer_closed(e: &io::Error) -> bool {
 /// `--one-off` was passed, in which case it exits after the first test).
 pub fn run_server(config: Config) {
     // Configure auth before entering the accept loop so every session sees it.
-    if config.rsa_private_key.is_some() {
+    let auth_configured =
+        config.rsa_private_key.is_some() && config.authorized_users.is_some();
+    if auth_configured {
         set_auth_config(config.rsa_private_key.clone(), config.authorized_users.clone());
+    }
+
+    if config.require_auth && !auth_configured {
+        eprintln!(
+            "ERROR: --require-auth set but --rsa-private-key and --authorized-users are not both configured; refusing to start"
+        );
+        return;
+    }
+
+    // Loud warning when binding a non-loopback address without auth — the
+    // server accepts any peer and can be used as a free bandwidth sink.
+    if !auth_configured && !is_loopback_bind(&config.host) {
+        eprintln!(
+            "WARNING: server bound to {} with no authentication configured. \
+             Any reachable peer can run tests. \
+             Pass --rsa-private-key + --authorized-users (and --require-auth) \
+             or bind to 127.0.0.1 for testing.",
+            config.host
+        );
     }
 
     let bind_addr = config.host_port();
@@ -235,9 +394,19 @@ pub fn run_server_loop(
         return run_concurrent_accept_loop(listener, handshake_timeout, config.max_concurrent);
     }
     loop {
-        match serve_one_session(&listener, handshake_timeout) {
-            Ok(_) => {}
-            Err(e) => eprintln!("session ended with error: {:?}", e),
+        // Wrap the per-session handler in `catch_unwind` so a panic inside
+        // (e.g. an OOM-abort-style hazard surviving the input caps, or a
+        // future indexing/unwrap bug on peer-controlled bytes) kills only
+        // this session, not the whole daemon. `AssertUnwindSafe` is needed
+        // because the listener is held by reference; we don't read any
+        // state across the catch boundary on the panic path.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            serve_one_session(&listener, handshake_timeout)
+        }));
+        match result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => eprintln!("session ended with error: {:?}", e),
+            Err(_) => eprintln!("session ended with panic — daemon continuing"),
         }
         if config.one_off {
             return Ok(());
@@ -270,11 +439,14 @@ fn run_concurrent_accept_loop(
     let registry: Arc<
         Mutex<HashMap<[u8; crate::common::cookie::COOKIE_LEN], crate::common::session::SessionHandle>>,
     > = Arc::new(Mutex::new(HashMap::new()));
+    let per_ip = PerIpCounter::default();
 
     loop {
-        let (sock, _addr) = listener.accept()?;
+        let (sock, peer_addr) = listener.accept()?;
+        let peer_ip = peer_addr.ip();
         let mut tcp = tcp_protocol(sock);
         tcp.transfer.set_read_timeout(handshake_timeout)?;
+        tcp.transfer.set_write_timeout(handshake_timeout)?;
         let cookie = match recv_cookie(tcp.transfer.as_mut()) {
             Ok(c) => c,
             Err(e) => {
@@ -285,6 +457,7 @@ fn run_concurrent_accept_loop(
 
         let mut reg = registry.lock().unwrap();
         if let Some(handle) = reg.get(&cookie) {
+            // Data stream attaching to an existing session — no new slot.
             if handle.data_tx.send(tcp).is_err() {
                 eprintln!(
                     "session channel closed; dropping stream for cookie {:?}",
@@ -295,12 +468,28 @@ fn run_concurrent_accept_loop(
             drop(reg);
             let _ = send_control_byte(tcp.transfer.as_mut(), Message::AccessDenied);
         } else {
+            // New session. Enforce the per-IP cap before reserving a slot.
+            let ip_handle = match per_ip.try_acquire(peer_ip, PER_IP_SESSION_CAP) {
+                Some(h) => h,
+                None => {
+                    drop(reg);
+                    eprintln!(
+                        "rejecting new session from {} (per-IP cap {} reached)",
+                        peer_ip, PER_IP_SESSION_CAP
+                    );
+                    let _ = send_control_byte(tcp.transfer.as_mut(), Message::AccessDenied);
+                    continue;
+                }
+            };
             let (session, handle) =
                 crate::common::session::Session::new(cookie, tcp);
             reg.insert(cookie, handle);
             drop(reg);
             let registry_cleanup = registry.clone();
             std::thread::spawn(move || {
+                // Keep the per-IP handle alive for the full session lifetime.
+                // Dropped automatically (decrementing the count) on any exit.
+                let _ip_guard = ip_handle;
                 let _ = serve_session_from_channel(session, handshake_timeout);
                 registry_cleanup.lock().unwrap().remove(&cookie);
             });
@@ -322,6 +511,11 @@ fn serve_session_from_channel(
 ) -> io::Result<u64> {
     let cpu_start = cpu::sample();
     let opts = negotiate_options(&mut session.control)?;
+    if let Err(e) = validate_options(&opts) {
+        eprintln!("rejecting options: {}", e);
+        let _ = send_control_byte(session.control.transfer.as_mut(), Message::AccessDenied);
+        return Err(e);
+    }
     check_auth(&mut session.control, &opts)?;
 
     if opts.udp {
@@ -552,6 +746,11 @@ fn serve_one_session(listener: &TcpListener, handshake_timeout: Option<Duration>
     let _ = cookie_display(&cookie);
 
     let opts = negotiate_options(&mut control)?;
+    if let Err(e) = validate_options(&opts) {
+        eprintln!("rejecting options: {}", e);
+        let _ = send_control_byte(control.transfer.as_mut(), Message::AccessDenied);
+        return Err(e);
+    }
     check_auth(&mut control, &opts)?;
 
     let receipts = if opts.udp {
@@ -1096,6 +1295,12 @@ pub fn accept_control(
     let (stream, _addr) = listener.accept()?;
     let mut control = tcp_protocol(stream);
     control.transfer.set_read_timeout(handshake_timeout)?;
+    // Apply a write timeout for the lifetime of the control socket so a
+    // slow-loris peer that accepts the cookie but stops reading cannot
+    // wedge the server during `send_framed_json` / control-byte writes.
+    // The read deadline can extend later (for long test windows); the
+    // write deadline stays at the handshake budget.
+    control.transfer.set_write_timeout(handshake_timeout)?;
     let cookie = recv_cookie(control.transfer.as_mut())?;
     Ok((control, cookie))
 }
@@ -1238,8 +1443,22 @@ pub fn tcp_protocol(stream: TcpStream) -> Protocol {
 }
 
 fn cookie_display(cookie: &[u8; COOKIE_LEN]) -> String {
-    // The first 36 bytes are ASCII alphanumerics; the last is NUL.
-    String::from_utf8_lossy(&cookie[..COOKIE_LEN - 1]).into_owned()
+    // The first 36 bytes are SUPPOSED to be ASCII alphanumerics, but the
+    // bytes are peer-controlled. `from_utf8_lossy` preserves control chars
+    // (0x01–0x1F including ESC), which would let a malicious peer inject
+    // terminal escape sequences into an operator's tty when this string
+    // is later logged. Render anything outside printable ASCII as a `.`
+    // so the operator's terminal sees a literal placeholder.
+    cookie[..COOKIE_LEN - 1]
+        .iter()
+        .map(|b| {
+            if b.is_ascii_graphic() || *b == b' ' {
+                *b as char
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1250,6 +1469,81 @@ mod tests {
     use std::io::Write;
     use std::net::TcpStream;
     use std::thread;
+
+    #[test]
+    fn per_ip_counter_caps_concurrent_sessions() {
+        let counter = PerIpCounter::default();
+        let ip: std::net::IpAddr = "192.0.2.1".parse().unwrap();
+        let h1 = counter.try_acquire(ip, 2).expect("first slot");
+        let h2 = counter.try_acquire(ip, 2).expect("second slot");
+        assert!(
+            counter.try_acquire(ip, 2).is_none(),
+            "third slot must be denied"
+        );
+        // A different IP is still allowed.
+        let other: std::net::IpAddr = "192.0.2.2".parse().unwrap();
+        assert!(counter.try_acquire(other, 2).is_some());
+        // Releasing one slot frees capacity for the original IP.
+        drop(h1);
+        assert!(counter.try_acquire(ip, 2).is_some());
+        drop(h2);
+    }
+
+    #[test]
+    fn cookie_display_sanitizes_control_chars() {
+        let mut hostile = [b'.'; COOKIE_LEN];
+        hostile[0] = 0x1b; // ESC — start of an ANSI escape sequence
+        hostile[1] = b'[';
+        hostile[2] = b'2';
+        hostile[3] = b'J';
+        hostile[4] = b'X'; // valid printable to confirm we keep good bytes
+        let rendered = cookie_display(&hostile);
+        assert!(!rendered.contains('\x1b'), "ESC must be stripped: {:?}", rendered);
+        assert!(rendered.starts_with('.'), "ESC byte should map to '.': {:?}", rendered);
+        assert!(rendered.contains('X'), "printable bytes must survive: {:?}", rendered);
+    }
+
+    #[test]
+    fn validate_options_accepts_defaults() {
+        let opts = ClientOptions::tcp_defaults(10, 4, DEFAULT_TCP_LEN as u32);
+        validate_options(&opts).expect("defaults must validate");
+    }
+
+    #[test]
+    fn validate_options_rejects_huge_parallel() {
+        let mut opts = ClientOptions::tcp_defaults(10, 4, DEFAULT_TCP_LEN as u32);
+        opts.parallel = u32::MAX;
+        assert!(validate_options(&opts).is_err(), "u32::MAX parallel must be rejected");
+    }
+
+    #[test]
+    fn validate_options_rejects_zero_parallel() {
+        let mut opts = ClientOptions::tcp_defaults(10, 4, DEFAULT_TCP_LEN as u32);
+        opts.parallel = 0;
+        assert!(validate_options(&opts).is_err(), "zero parallel must be rejected");
+    }
+
+    #[test]
+    fn validate_options_rejects_huge_len() {
+        let mut opts = ClientOptions::tcp_defaults(10, 4, DEFAULT_TCP_LEN as u32);
+        opts.len = u32::MAX;
+        assert!(validate_options(&opts).is_err(), "u32::MAX len must be rejected");
+    }
+
+    #[test]
+    fn validate_options_rejects_huge_time() {
+        let mut opts = ClientOptions::tcp_defaults(10, 4, DEFAULT_TCP_LEN as u32);
+        opts.time = u32::MAX;
+        assert!(validate_options(&opts).is_err(), "u32::MAX time must be rejected");
+    }
+
+    #[test]
+    fn validate_options_rejects_overflow_time_plus_omit() {
+        let mut opts = ClientOptions::tcp_defaults(MAX_TEST_DURATION_SECS, 4, DEFAULT_TCP_LEN as u32);
+        opts.omit = MAX_OMIT_SECS;
+        // Within the per-field caps but still well under u32::MAX — should be fine.
+        validate_options(&opts).expect("at-cap values must validate");
+    }
 
     /// Bind a `TcpListener` on an ephemeral loopback port and return it
     /// along with its concrete address so the test client can reach it.

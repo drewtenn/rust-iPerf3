@@ -144,6 +144,10 @@ Knob flags:
 
 ### Test against itself
 
+> **Bind default:** the server binds `127.0.0.1` by default. To accept
+> connections from other hosts, pass `-B 0.0.0.0` (or a specific
+> interface address) — and consider `--require-auth`.
+
 ```
 # Terminal A
 cargo run --release -- -s -p 5202
@@ -317,6 +321,7 @@ openssl rsa -in /tmp/server-priv.pem -pubout -out /tmp/server-pub.pem
 
 # 2. Create an authorized_users file with sha256 of "secret"
 echo "alice,$(printf secret | shasum -a 256 | awk '{print $1}')" > /tmp/authorized_users
+chmod 0600 /tmp/authorized_users /tmp/server-priv.pem  # server refuses world/group-readable secret files
 
 # 3. Start the server with auth
 ./target/release/rperf3 -s -p 5201 \

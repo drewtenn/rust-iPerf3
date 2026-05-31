@@ -53,6 +53,7 @@ fn self_test_loopback_tcp_short_run() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
 
     // Tiny delay so the server thread reaches listener.accept() before
@@ -113,6 +114,7 @@ fn self_test_omit_separates_omit_window_from_measurement_window() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
 
     thread::sleep(Duration::from_millis(50));
@@ -205,6 +207,7 @@ fn self_test_loopback_udp_short_run() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
 
     thread::sleep(Duration::from_millis(50));
@@ -283,6 +286,7 @@ fn self_test_loopback_tcp_reverse() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
     thread::sleep(Duration::from_millis(50));
     rperf3::run_client(cfg);
@@ -328,6 +332,7 @@ fn self_test_loopback_udp_reverse() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
     thread::sleep(Duration::from_millis(50));
     rperf3::run_client(cfg);
@@ -374,6 +379,7 @@ fn self_test_loopback_tcp_bidir() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
     thread::sleep(Duration::from_millis(50));
     rperf3::run_client(cfg);
@@ -416,6 +422,7 @@ fn self_test_concurrent_three_clients() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
 
     let server = thread::spawn(move || {
@@ -459,6 +466,7 @@ fn self_test_concurrent_three_clients() {
                 rsa_public_key: None,
                 rsa_private_key: None,
                 authorized_users: None,
+                require_auth: false,
             };
             rperf3::run_client(cfg);
         }));
@@ -509,6 +517,7 @@ fn self_test_concurrent_three_udp_clients() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
 
     let server = thread::spawn(move || {
@@ -550,6 +559,7 @@ fn self_test_concurrent_three_udp_clients() {
                 rsa_public_key: None,
                 rsa_private_key: None,
                 authorized_users: None,
+                require_auth: false,
             };
             rperf3::run_client(cfg);
         }));
@@ -597,6 +607,7 @@ fn self_test_loopback_udp_bidir() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
     thread::sleep(Duration::from_millis(50));
     rperf3::run_client(cfg);

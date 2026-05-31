@@ -17,8 +17,13 @@ pub const DEFAULT_PORT: u16 = 5201;
 pub const DEFAULT_TIME_SECS: u32 = 10;
 /// Default parallel stream count.
 pub const DEFAULT_PARALLEL: u32 = 1;
-/// Default listen address when running as a server.
-pub const DEFAULT_BIND: &str = "0.0.0.0";
+/// Default listen address when running as a server. Loopback by default
+/// (defense in depth): an operator who needs to expose the server on
+/// other interfaces must opt in with `-B 0.0.0.0` or a specific address.
+/// iperf3 binds all interfaces by default; we deviate so the typical
+/// "ran rperf3 to test something locally" case isn't an accidental
+/// public bandwidth sink.
+pub const DEFAULT_BIND: &str = "127.0.0.1";
 /// Default omit-window length in seconds. Matches iPerf3's behavior of
 /// not omitting anything unless explicitly requested.
 pub const DEFAULT_OMIT_SECS: u32 = 0;
@@ -178,6 +183,13 @@ pub struct Cli {
     /// Format: one `username,sha256hex_of_password` per line.
     #[arg(long = "authorized-users")]
     pub authorized_users: Option<std::path::PathBuf>,
+
+    /// Refuse to start the server unless RSA auth is configured. Without
+    /// this flag, a server with no `--rsa-private-key` runs anonymously,
+    /// which is convenient for testing on a trusted host but lets any
+    /// reachable client consume bandwidth. Recommended for production.
+    #[arg(long = "require-auth", default_value_t = false)]
+    pub require_auth: bool,
 }
 
 /// Result of a successful parse: either client or server mode, each
@@ -266,6 +278,7 @@ impl Cli {
             rsa_public_key: self.rsa_public_key,
             rsa_private_key: self.rsa_private_key,
             authorized_users: self.authorized_users,
+            require_auth: self.require_auth,
         };
         Ok(if self.server { Mode::Server(base) } else { Mode::Client(base) })
     }

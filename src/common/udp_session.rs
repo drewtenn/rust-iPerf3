@@ -17,7 +17,6 @@ use crate::server::StreamReceipt;
 /// The 4-byte "stream-init" datagram that iperf3 3.x clients send to the
 /// server's UDP port after the TCP `CreateStreams` control byte.  The
 /// server must reply with `UDP_STREAM_ACK` to complete the handshake.
-#[cfg(test)]
 const UDP_STREAM_INIT: &[u8] = b"9876";
 
 /// The 4-byte acknowledgment the server sends back to the client after
@@ -44,18 +43,30 @@ pub fn bind_udp(addr: &str, handshake_timeout: Option<Duration>) -> io::Result<U
 /// terminates the test.
 ///
 /// When using rPerf3 as the client, the client sends the 37-byte session
-/// cookie instead.  Both formats are accepted here: any datagram whose
-/// source address has not been seen before is treated as a stream-init
-/// and acknowledged with `b"6789"`.
+/// cookie instead. Only datagrams whose payload exactly matches the
+/// expected 37-byte cookie or the 4-byte iperf3 init are accepted; any
+/// other datagram is silently dropped without an ACK reply, which
+/// prevents off-path attackers from registering spoofed source addresses
+/// as streams (and prevents the server from acting as a reflector).
 pub fn accept_udp_streams(
     socket: &UdpSocket,
-    _expected_cookie: &[u8; COOKIE_LEN],
+    expected_cookie: &[u8; COOKIE_LEN],
     n: u32,
 ) -> io::Result<Vec<SocketAddr>> {
     let mut addrs = Vec::with_capacity(n as usize);
+    let mut seen = std::collections::HashSet::new();
     let mut buf = [0u8; 65_536];
-    for _ in 0..n {
-        let (_len, src) = socket.recv_from(&mut buf)?;
+    while addrs.len() < n as usize {
+        let (len, src) = socket.recv_from(&mut buf)?;
+        let payload = &buf[..len];
+        let is_valid_init = payload == &expected_cookie[..]
+            || payload == UDP_STREAM_INIT;
+        if !is_valid_init {
+            continue;
+        }
+        if !seen.insert(src) {
+            continue;
+        }
         // Reply with the iperf3 stream-init acknowledgment.  rPerf3 clients
         // ignore this extra datagram; iperf3 clients require it to proceed.
         let _ = socket.send_to(UDP_STREAM_ACK, src);
@@ -265,6 +276,55 @@ mod tests {
 
         let (n, buf) = client.join().unwrap();
         assert_eq!(&buf[..n], UDP_STREAM_ACK, "server should reply with 6789 for iperf3 init");
+    }
+
+    /// Spoofed-source-address datagrams (random bytes that don't match the
+    /// cookie or iperf3 init) must be silently dropped and not consume a
+    /// stream slot or trigger an ACK reply.  Regression test for H6.
+    #[test]
+    fn accept_udp_streams_rejects_unrelated_payload() {
+        let server = bind_udp("127.0.0.1:0", Some(Duration::from_secs(2))).expect("bind");
+        let cookie = generate_cookie();
+        let server_addr = server.local_addr().unwrap();
+
+        let attacker = thread::spawn(move || {
+            let sock = UdpSocket::bind("127.0.0.1:0").expect("attacker bind");
+            sock.connect(server_addr).expect("attacker connect");
+            // Send random non-cookie bytes — must NOT register the source.
+            sock.send(b"garbage-payload").expect("attacker send");
+            sock.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+            let mut buf = [0u8; 16];
+            // Server must not reply (no reflection).
+            sock.recv(&mut buf).err().map(|e| e.kind())
+        });
+
+        let legitimate = {
+            let cookie_for_thread = cookie;
+            thread::spawn(move || {
+                // Brief delay so the attacker's bogus datagram arrives first.
+                thread::sleep(Duration::from_millis(50));
+                let sock = UdpSocket::bind("127.0.0.1:0").expect("legit bind");
+                sock.connect(server_addr).expect("legit connect");
+                sock.send(&cookie_for_thread).expect("legit send cookie");
+                let mut buf = [0u8; 16];
+                sock.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+                sock.recv(&mut buf).expect("legit recv ack");
+            })
+        };
+
+        let addrs = accept_udp_streams(&server, &cookie, 1).expect("accept");
+        assert_eq!(addrs.len(), 1, "exactly one stream registered");
+
+        legitimate.join().unwrap();
+        let attacker_err_kind = attacker.join().unwrap();
+        assert!(
+            matches!(
+                attacker_err_kind,
+                Some(io::ErrorKind::WouldBlock) | Some(io::ErrorKind::TimedOut)
+            ),
+            "attacker must NOT have received an ACK (got {:?})",
+            attacker_err_kind
+        );
     }
 
     /// Verify that `run_udp_receiver` terminates within the grace deadline

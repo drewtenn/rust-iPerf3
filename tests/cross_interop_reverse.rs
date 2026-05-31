@@ -60,6 +60,7 @@ fn rperf3_client_reverse_against_iperf3_server() {
         rsa_public_key: None,
         rsa_private_key: None,
         authorized_users: None,
+        require_auth: false,
     };
     rperf3::run_client(cfg);
     let output = iperf3_server.wait_with_output().expect("wait iperf3");
